@@ -13,11 +13,17 @@
  * - Symlink resolution (optional)
  * - Traversal pattern detection
  *
+ * Canonicalization is symmetric: a candidate is only ever compared against
+ * prefixes held in the same form it was resolved in. Canonicalizing one side
+ * and not the other silently denies everything under a symlinked prefix
+ * (async) or silently accepts an escape through one (sync).
+ *
  * @module v3/security/path-validator
  */
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { realpathSync } from 'fs';
 
 export interface PathValidatorConfig {
   /**
@@ -134,6 +140,60 @@ const DEFAULT_BLOCKED_NAMES = [
 ];
 
 /**
+ * Canonicalizes a path that may not exist yet, by resolving the longest
+ * ancestor that DOES exist and re-attaching the remaining segments.
+ *
+ * Plain `realpath` throws ENOENT for a path whose leaf is missing, which
+ * would leave the caller comparing a canonical prefix against a merely
+ * lexical candidate — the asymmetry this whole helper exists to avoid.
+ * Walking up also means a symlinked PARENT is still resolved, so a
+ * not-yet-created file under a symlinked directory canonicalizes to its
+ * real location instead of its lexical one.
+ *
+ * Falls back to the lexical path if the ancestor walk itself fails (EACCES,
+ * ELOOP, …), preserving the previous behaviour rather than throwing out of
+ * a validation call.
+ */
+async function canonicalize(resolvedPath: string): Promise<string> {
+  try {
+    return await fs.realpath(resolvedPath);
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') {
+      return resolvedPath;
+    }
+  }
+
+  const parent = path.dirname(resolvedPath);
+  // dirname() of a root ('/' or 'C:\\') is itself — stop instead of recursing.
+  if (parent === resolvedPath) {
+    return resolvedPath;
+  }
+
+  return path.join(await canonicalize(parent), path.basename(resolvedPath));
+}
+
+/**
+ * Synchronous twin of {@link canonicalize}, for the constructor and
+ * {@link PathValidator.addPrefix} which cannot await.
+ */
+function canonicalizeSync(resolvedPath: string): string {
+  try {
+    return realpathSync(resolvedPath);
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') {
+      return resolvedPath;
+    }
+  }
+
+  const parent = path.dirname(resolvedPath);
+  if (parent === resolvedPath) {
+    return resolvedPath;
+  }
+
+  return path.join(canonicalizeSync(parent), path.basename(resolvedPath));
+}
+
+/**
  * Path validator that prevents traversal attacks.
  *
  * This class validates file paths to ensure they stay within
@@ -153,7 +213,18 @@ const DEFAULT_BLOCKED_NAMES = [
  */
 export class PathValidator {
   private readonly config: Required<PathValidatorConfig>;
+  /** Lexically resolved prefixes — compared against lexically resolved candidates. */
   private readonly resolvedPrefixes: string[];
+  /**
+   * Symlink-resolved prefixes — compared against symlink-resolved candidates.
+   *
+   * Kept as a SECOND list rather than replacing `resolvedPrefixes`, because
+   * the two comparison sites derive their candidate differently: `validate()`
+   * canonicalizes through the filesystem, `validateSync()`/`isWithinAllowed()`
+   * are documented as lexical-only. Canonicalizing one side without the other
+   * is exactly the bug this fixes, in whichever direction it is done.
+   */
+  private readonly canonicalPrefixes: string[];
 
   constructor(config: PathValidatorConfig) {
     this.config = {
@@ -177,6 +248,7 @@ export class PathValidator {
     this.resolvedPrefixes = this.config.allowedPrefixes.map(p =>
       path.resolve(p)
     );
+    this.canonicalPrefixes = this.resolvedPrefixes.map(canonicalizeSync);
   }
 
   /**
@@ -225,6 +297,10 @@ export class PathValidator {
 
     // Resolve the path
     let resolvedPath: string;
+    // Which prefix list this candidate may legitimately be compared against:
+    // only a symlink-resolved candidate may be matched against symlink-resolved
+    // prefixes. See `canonicalPrefixes`.
+    let symlinksResolved = false;
     try {
       resolvedPath = path.resolve(inputPath);
 
@@ -232,6 +308,7 @@ export class PathValidator {
       if (this.config.resolveSymlinks) {
         try {
           resolvedPath = await fs.realpath(resolvedPath);
+          symlinksResolved = true;
         } catch (error: any) {
           // Path doesn't exist yet - use resolved path
           if (error.code !== 'ENOENT' || !this.config.allowNonExistent) {
@@ -240,6 +317,15 @@ export class PathValidator {
             } else {
               errors.push(`Failed to resolve path: ${error.message}`);
             }
+          }
+          if (error.code === 'ENOENT') {
+            // The leaf does not exist, but its ancestors may still be
+            // symlinks. Canonicalize what exists so the candidate is in the
+            // same form as `canonicalPrefixes` — otherwise every not-yet-
+            // created path under a symlinked prefix (macOS `/var` ->
+            // `/private/var`, `/tmp` -> `/private/tmp`) fails to match.
+            resolvedPath = await canonicalize(resolvedPath);
+            symlinksResolved = true;
           }
         }
       }
@@ -258,7 +344,11 @@ export class PathValidator {
     let relativePath = '';
     let prefixMatched = false;
 
-    for (const prefix of this.resolvedPrefixes) {
+    const prefixes = symlinksResolved
+      ? this.canonicalPrefixes
+      : this.resolvedPrefixes;
+
+    for (const prefix of prefixes) {
       if (resolvedPath === prefix || resolvedPath.startsWith(prefix + path.sep)) {
         prefixMatched = true;
         matchedPrefix = prefix;
@@ -465,6 +555,7 @@ export class PathValidator {
     if (!this.resolvedPrefixes.includes(resolved)) {
       this.config.allowedPrefixes.push(prefix);
       this.resolvedPrefixes.push(resolved);
+      this.canonicalPrefixes.push(canonicalizeSync(resolved));
     }
   }
 
