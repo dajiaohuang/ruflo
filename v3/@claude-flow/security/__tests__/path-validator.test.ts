@@ -322,9 +322,12 @@ describe('PathValidator', () => {
     let realDir: string;
     let linkDir: string;
     let outsideDir: string;
-    let symlinksSupported = true;
+    let symlinksSupported: boolean;
 
     beforeEach(async () => {
+      // Reset per case: a single denied link creation must not silently
+      // suppress every later assertion in the block.
+      symlinksSupported = true;
       root = await fsp.mkdtemp(path.join(os.tmpdir(), 'path-validator-'));
       realDir = path.join(root, 'real');
       linkDir = path.join(root, 'link');
@@ -346,8 +349,8 @@ describe('PathValidator', () => {
       await fsp.rm(root, { recursive: true, force: true });
     });
 
-    it('accepts an existing file under a symlinked prefix', async () => {
-      if (!symlinksSupported) return;
+    it('accepts an existing file under a symlinked prefix', async (ctx) => {
+      if (!symlinksSupported) ctx.skip();
       const file = path.join(realDir, 'binary');
       await fsp.writeFile(file, 'contents');
 
@@ -363,8 +366,8 @@ describe('PathValidator', () => {
       expect(result.relativePath).toBe('binary');
     });
 
-    it('accepts a not-yet-created file under a symlinked prefix', async () => {
-      if (!symlinksSupported) return;
+    it('accepts a not-yet-created file under a symlinked prefix', async (ctx) => {
+      if (!symlinksSupported) ctx.skip();
       const linkValidator = new PathValidator({
         allowedPrefixes: [linkDir],
         allowHidden: true,
@@ -377,8 +380,8 @@ describe('PathValidator', () => {
       expect(result.isValid).toBe(true);
     });
 
-    it('still rejects a symlink that escapes the prefix', async () => {
-      if (!symlinksSupported) return;
+    it('still rejects a symlink that escapes the prefix', async (ctx) => {
+      if (!symlinksSupported) ctx.skip();
       const secret = path.join(outsideDir, 'secret');
       await fsp.writeFile(secret, 'contents');
       await fsp.symlink(outsideDir, path.join(realDir, 'escape'), 'junction');
@@ -394,8 +397,8 @@ describe('PathValidator', () => {
       expect(result.errors).toContain('Path is outside allowed directories');
     });
 
-    it('rejects a not-yet-created file under an escaping symlink', async () => {
-      if (!symlinksSupported) return;
+    it('rejects a not-yet-created file under an escaping symlink', async (ctx) => {
+      if (!symlinksSupported) ctx.skip();
       await fsp.symlink(outsideDir, path.join(realDir, 'escape'), 'junction');
 
       const linkValidator = new PathValidator({
@@ -410,8 +413,8 @@ describe('PathValidator', () => {
       expect(result.errors).toContain('Path is outside allowed directories');
     });
 
-    it('keeps validateSync lexical, so a symlinked prefix still matches', () => {
-      if (!symlinksSupported) return;
+    it('keeps validateSync lexical, so a symlinked prefix still matches', (ctx) => {
+      if (!symlinksSupported) ctx.skip();
       const linkValidator = new PathValidator({
         allowedPrefixes: [linkDir],
         allowHidden: true,
@@ -424,6 +427,39 @@ describe('PathValidator', () => {
 
       expect(result.isValid).toBe(true);
       expect(linkValidator.isWithinAllowed(path.join(linkDir, 'binary'))).toBe(true);
+    });
+
+    it('does not canonicalize when non-existent paths are forbidden', async (ctx) => {
+      if (!symlinksSupported) ctx.skip();
+      // The call already fails; canonicalizing anyway would rewrite the
+      // resolvedPath and matchedPrefix that callers read off the result.
+      const strict = new PathValidator({
+        allowedPrefixes: [linkDir],
+        allowHidden: true,
+        allowNonExistent: false,
+      });
+
+      const result = await strict.validate(path.join(linkDir, 'missing'));
+
+      expect(result.isValid).toBe(false);
+      expect(result.errors).toContain('Path does not exist');
+      expect(result.resolvedPath).toBe(path.join(linkDir, 'missing'));
+    });
+
+    it('pins an allowed prefix to the directory it named at construction', async (ctx) => {
+      if (!symlinksSupported) ctx.skip();
+      // Re-resolving the prefix on every call would let whoever can rewrite
+      // the link redirect the allowlist afterwards. The prefix therefore keeps
+      // denoting what it named when the validator was configured.
+      const pinned = new PathValidator({ allowedPrefixes: [linkDir], allowHidden: true });
+      await fsp.writeFile(path.join(realDir, 'file'), 'contents');
+      await fsp.writeFile(path.join(outsideDir, 'file'), 'contents');
+
+      await fsp.unlink(linkDir);
+      await fsp.symlink(outsideDir, linkDir, 'junction');
+
+      expect((await pinned.validate(path.join(realDir, 'file'))).isValid).toBe(true);
+      expect((await pinned.validate(path.join(outsideDir, 'file'))).isValid).toBe(false);
     });
 
     it('validates a temp-directory tree the way an installer does', async () => {
@@ -445,6 +481,59 @@ describe('PathValidator', () => {
       } finally {
         await fsp.rm(workDir, { recursive: true, force: true });
       }
+    });
+  });
+
+  /**
+   * A root prefix already ends in a separator, so anchoring the match by
+   * appending another looked for `//` and rejected every descendant. Reachable
+   * as `/` or `C:\` directly, and now also whenever a prefix canonicalizes to
+   * a root.
+   */
+  describe('Root prefixes', () => {
+    const root = path.parse(process.cwd()).root;
+
+    it('accepts descendants of a root prefix', async () => {
+      const rootValidator = new PathValidator({
+        allowedPrefixes: [root],
+        allowHidden: true,
+        blockedNames: [],
+        blockedExtensions: [],
+      });
+
+      const result = await rootValidator.validate(path.join(root, 'etc', 'hosts'));
+
+      expect(result.errors).toEqual([]);
+      expect(result.isValid).toBe(true);
+      expect(result.matchedPrefix).toBe(root);
+      // Not compared to a literal: `/etc` is itself a symlink on macOS, so the
+      // canonical location is platform-dependent. What must hold everywhere is
+      // that the relative path is relative — the old `prefix + sep` boundary
+      // would have produced a leading separator had it matched at all.
+      expect(result.relativePath.startsWith(path.sep)).toBe(false);
+      expect(path.join(root, result.relativePath)).toBe(result.resolvedPath);
+    });
+
+    it('accepts descendants of a root prefix synchronously too', () => {
+      const rootValidator = new PathValidator({
+        allowedPrefixes: [root],
+        allowHidden: true,
+        blockedNames: [],
+        blockedExtensions: [],
+      });
+
+      expect(rootValidator.validateSync(path.join(root, 'etc', 'hosts')).isValid).toBe(true);
+      expect(rootValidator.isWithinAllowed(path.join(root, 'etc', 'hosts'))).toBe(true);
+    });
+
+    it('still anchors non-root prefixes at a separator boundary', async () => {
+      const boundaryValidator = new PathValidator({
+        allowedPrefixes: ['/srv/app'],
+        allowHidden: true,
+      });
+
+      expect((await boundaryValidator.validate('/srv/app-secrets/key')).isValid).toBe(false);
+      expect(boundaryValidator.isWithinAllowed('/srv/app-secrets/key')).toBe(false);
     });
   });
 });
