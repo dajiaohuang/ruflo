@@ -277,11 +277,8 @@ function sessionGet(key) {
 
 function sessionSet(key, value) {
   try {
-    if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
-    let session = {};
-    if (fs.existsSync(SESSION_FILE)) {
-      session = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
-    }
+    if (!fs.existsSync(SESSION_FILE)) return;
+    const session = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
     if (!session.context) session.context = {};
     session.context[key] = value;
     session.updatedAt = new Date().toISOString();
